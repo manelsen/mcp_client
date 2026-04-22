@@ -1,9 +1,9 @@
-name = "gleam_mcp"
+name = "mcp_client"
 version = "0.1.0"
 description = "MCP (Model Context Protocol) client for Gleam — connect to any MCP server via JSON-RPC 2.0 over STDIO"
 licences = ["Apache-2.0"]
-repository = { type = "github", user = "manelsen", repo = "gleam_mcp" }
-links = [{ title = "Hex", href = "https://hex.pm/packages/gleam_mcp" }]
+repository = { type = "github", user = "manelsen", repo = "mcp_client" }
+links = [{ title = "Hex", href = "https://hex.pm/packages/mcp_client" }]
 target = "erlang"
 
 [dependencies]

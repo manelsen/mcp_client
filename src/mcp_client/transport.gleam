@@ -21,24 +21,24 @@ import gleam/string
 // FFI Bindings
 // ============================================================================
 
-@external(erlang, "gleam_mcp_ffi", "open_port")
+@external(erlang, "mcp_client_ffi", "open_port")
 fn do_open_port(
   command: String,
   args: List(String),
   env: List(#(String, String)),
 ) -> Result(Dynamic, String)
 
-@external(erlang, "gleam_mcp_ffi", "send_and_receive")
+@external(erlang, "mcp_client_ffi", "send_and_receive")
 fn do_send_and_receive(
   port: Dynamic,
   data: String,
   timeout_ms: Int,
 ) -> Result(String, String)
 
-@external(erlang, "gleam_mcp_ffi", "send_data")
+@external(erlang, "mcp_client_ffi", "send_data")
 fn do_send_data(port: Dynamic, data: String) -> Result(Nil, String)
 
-@external(erlang, "gleam_mcp_ffi", "close_port")
+@external(erlang, "mcp_client_ffi", "close_port")
 fn do_close_port(port: Dynamic) -> Nil
 
 /// Opaque type for Erlang port references.

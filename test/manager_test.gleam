@@ -1,12 +1,16 @@
 //// Tests for MCP Manager with real MCP protocol.
 ////
-//// Verifies multi-server management, tool discovery, and routing
-//// using a mock MCP server over real STDIO transport.
+//// Verifies multi-server management, tool/resource/prompt discovery,
+//// routing, and reconnection using mock MCP servers over real STDIO transport.
 
+import gleam/dict
 import gleam/list
 import gleam/string
 import gleeunit/should
-import gleam_mcp/manager
+import mcp_client/manager
+
+@external(erlang, "mcp_client_ffi", "delete_file_if_exists")
+fn delete_file_if_exists(path: String) -> Nil
 
 // ============================================================================
 // Basic Manager Tests
@@ -14,16 +18,12 @@ import gleam_mcp/manager
 
 pub fn start_manager_test() {
   let assert Ok(mgr) = manager.start()
-
-  let servers = manager.list_servers(mgr)
-  servers
-  |> should.equal([])
-
+  manager.list_servers(mgr) |> should.equal([])
   manager.stop(mgr)
 }
 
 // ============================================================================
-// Server Registration Tests (with mock MCP server)
+// Server Registration Tests
 // ============================================================================
 
 pub fn register_mock_server_test() {
@@ -35,14 +35,11 @@ pub fn register_mock_server_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
-
-  let servers = manager.list_servers(mgr)
-  servers
-  |> should.equal(["mock-server"])
-
+  manager.list_servers(mgr) |> should.equal(["mock-server"])
   manager.stop(mgr)
 }
 
@@ -55,13 +52,11 @@ pub fn register_duplicate_server_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
-  let result = manager.register(mgr, config)
-  result
-  |> should.be_error
-
+  manager.register(mgr, config) |> should.be_error
   manager.stop(mgr)
 }
 
@@ -74,12 +69,10 @@ pub fn register_invalid_command_test() {
       command: "nonexistent_command_xyz",
       args: [],
       env: [],
+      retry: manager.NoRetry,
     )
 
-  let result = manager.register(mgr, config)
-  result
-  |> should.be_error
-
+  manager.register(mgr, config) |> should.be_error
   manager.stop(mgr)
 }
 
@@ -92,29 +85,18 @@ pub fn get_server_config_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
-
-  let result = manager.get_server(mgr, "my-server")
-  case result {
-    Ok(cfg) -> {
-      cfg.command
-      |> should.equal("python3")
-    }
-    Error(_) -> should.fail()
-  }
-
+  let assert Ok(cfg) = manager.get_server(mgr, "my-server")
+  cfg.command |> should.equal("python3")
   manager.stop(mgr)
 }
 
 pub fn get_nonexistent_server_test() {
   let assert Ok(mgr) = manager.start()
-
-  let result = manager.get_server(mgr, "nope")
-  result
-  |> should.be_error
-
+  manager.get_server(mgr, "nope") |> should.be_error
   manager.stop(mgr)
 }
 
@@ -131,16 +113,14 @@ pub fn discover_tools_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
 
   let tools = manager.list_tools(mgr)
-  tools
-  |> list.length
-  |> should.equal(4)
+  tools |> list.length |> should.equal(4)
 
-  // Tool names are qualified as "server_name/tool_name"
   let tool_names =
     tools
     |> list.map(fn(t) { t.spec.name })
@@ -152,15 +132,201 @@ pub fn discover_tools_test() {
     "tool-server/special_chars",
   ])
 
-  // original_name is unqualified
   let original_names =
     tools
     |> list.map(fn(t) { t.original_name })
     |> list.sort(string.compare)
 
-  original_names
-  |> should.equal(["add", "big_data", "echo", "special_chars"])
+  original_names |> should.equal(["add", "big_data", "echo", "special_chars"])
+  manager.stop(mgr)
+}
 
+// ============================================================================
+// Resource Discovery Tests
+// ============================================================================
+
+pub fn discover_resources_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "resource-server",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  let resources = manager.list_resources(mgr)
+  resources |> list.length |> should.equal(2)
+
+  let uris =
+    resources
+    |> list.map(fn(r) { r.uri })
+    |> list.sort(string.compare)
+
+  uris |> should.equal(["file:///hello.txt", "file:///world.txt"])
+
+  resources
+  |> list.all(fn(r) { r.server_name == "resource-server" })
+  |> should.equal(True)
+
+  manager.stop(mgr)
+}
+
+pub fn read_resource_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "read-server",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  let assert Ok(result) =
+    manager.read_resource(mgr, "read-server", "file:///hello.txt")
+
+  result |> string.contains("Hello") |> should.equal(True)
+  manager.stop(mgr)
+}
+
+pub fn read_nonexistent_resource_returns_error_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "read-server2",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  manager.read_resource(mgr, "read-server2", "file:///does-not-exist.txt")
+  |> should.be_error
+
+  manager.stop(mgr)
+}
+
+pub fn unregister_removes_resources_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "temp-res",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_resources(mgr) |> list.length |> should.equal(2)
+
+  let assert Ok(Nil) = manager.unregister(mgr, "temp-res")
+  manager.list_resources(mgr) |> should.equal([])
+  manager.stop(mgr)
+}
+
+// ============================================================================
+// Prompt Discovery Tests
+// ============================================================================
+
+pub fn discover_prompts_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "prompt-server",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  let prompts = manager.list_prompts(mgr)
+  prompts |> list.length |> should.equal(1)
+
+  let names = prompts |> list.map(fn(p) { p.name })
+  names |> should.equal(["greet"])
+
+  prompts
+  |> list.all(fn(p) { p.server_name == "prompt-server" })
+  |> should.equal(True)
+
+  manager.stop(mgr)
+}
+
+pub fn get_prompt_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "get-prompt-server",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  let args = dict.from_list([#("name", "Alice")])
+  let assert Ok(result) =
+    manager.get_prompt(mgr, "get-prompt-server", "greet", args)
+
+  result |> string.contains("Alice") |> should.equal(True)
+  manager.stop(mgr)
+}
+
+pub fn get_nonexistent_prompt_returns_error_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "prompt-server2",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+
+  manager.get_prompt(mgr, "prompt-server2", "no_such_prompt", dict.new())
+  |> should.be_error
+
+  manager.stop(mgr)
+}
+
+pub fn unregister_removes_prompts_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "temp-prompt",
+      command: "python3",
+      args: ["test/mock_mcp_server.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_prompts(mgr) |> list.length |> should.equal(1)
+
+  let assert Ok(Nil) = manager.unregister(mgr, "temp-prompt")
+  manager.list_prompts(mgr) |> should.equal([])
   manager.stop(mgr)
 }
 
@@ -177,25 +343,15 @@ pub fn execute_echo_tool_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
 
-  // Tool names are qualified after discovery
-  let result =
+  let assert Ok(response) =
     manager.execute_tool(mgr, "exec-server/echo", "{\"message\":\"test\"}")
-  case result {
-    Ok(response) -> {
-      response
-      |> string.contains("test")
-      |> should.equal(True)
-    }
-    Error(e) -> {
-      let _ = e
-      should.fail()
-    }
-  }
 
+  response |> string.contains("test") |> should.equal(True)
   manager.stop(mgr)
 }
 
@@ -208,17 +364,12 @@ pub fn execute_nonexistent_tool_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
-
-  // Neither bare name nor wrong qualified name should work
-  manager.execute_tool(mgr, "nonexistent", "{}")
-  |> should.be_error
-
-  manager.execute_tool(mgr, "exec-server2/nonexistent", "{}")
-  |> should.be_error
-
+  manager.execute_tool(mgr, "nonexistent", "{}") |> should.be_error
+  manager.execute_tool(mgr, "exec-server2/nonexistent", "{}") |> should.be_error
   manager.stop(mgr)
 }
 
@@ -235,35 +386,21 @@ pub fn unregister_server_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_servers(mgr) |> should.equal(["temp-server"])
 
-  // Verify server is registered
-  manager.list_servers(mgr)
-  |> should.equal(["temp-server"])
-
-  // Unregister
   let assert Ok(Nil) = manager.unregister(mgr, "temp-server")
-
-  // Verify server is gone
-  manager.list_servers(mgr)
-  |> should.equal([])
-
-  // Verify tools are gone
-  manager.list_tools(mgr)
-  |> should.equal([])
-
+  manager.list_servers(mgr) |> should.equal([])
+  manager.list_tools(mgr) |> should.equal([])
   manager.stop(mgr)
 }
 
 pub fn unregister_nonexistent_server_test() {
   let assert Ok(mgr) = manager.start()
-
-  let result = manager.unregister(mgr, "nonexistent")
-  result
-  |> should.be_error
-
+  manager.unregister(mgr, "nonexistent") |> should.be_error
   manager.stop(mgr)
 }
 
@@ -280,6 +417,7 @@ pub fn multiple_servers_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let config2 =
@@ -288,24 +426,19 @@ pub fn multiple_servers_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config1)
   let assert Ok(Nil) = manager.register(mgr, config2)
 
-  let servers = manager.list_servers(mgr)
-  servers
-  |> should.equal(["server-1", "server-2"])
+  manager.list_servers(mgr) |> should.equal(["server-1", "server-2"])
 
-  // Tools from both servers are discoverable without collision:
-  // each is qualified as "server-name/tool-name"
-  let tools = manager.list_tools(mgr)
   let tool_names =
-    tools
+    manager.list_tools(mgr)
     |> list.map(fn(t) { t.spec.name })
     |> list.sort(string.compare)
 
-  // server-1 and server-2 each provide 4 tools — 8 total, no collisions
   tool_names
   |> should.equal([
     "server-1/add", "server-1/big_data", "server-1/echo",
@@ -313,11 +446,84 @@ pub fn multiple_servers_test() {
     "server-2/echo", "server-2/special_chars",
   ])
 
+  // 2 resources per server × 2 servers = 4 total
+  manager.list_resources(mgr) |> list.length |> should.equal(4)
+
+  // 1 prompt per server × 2 servers = 2 total
+  manager.list_prompts(mgr) |> list.length |> should.equal(2)
+
   manager.stop(mgr)
 }
 
 // ============================================================================
-// Regression tests
+// Reconnection Test
+// ============================================================================
+
+pub fn reconnect_after_crash_test() {
+  let flag = "/tmp/gleam_mcp_crash_once_test_flag"
+  // Ensure no stale flag from a previous failed run
+  delete_file_if_exists(flag)
+
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "reconnect-test",
+      command: "python3",
+      args: ["test/mock_mcp_server_crash_once.py", flag],
+      env: [],
+      retry: manager.Retry(max_attempts: 3, base_delay_ms: 10),
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_servers(mgr) |> should.equal(["reconnect-test"])
+  manager.list_tools(mgr) |> list.length |> should.equal(1)
+
+  // First call: server exits without responding → Error, reconnection triggered
+  let _ =
+    manager.execute_tool(
+      mgr,
+      "reconnect-test/echo",
+      "{\"message\":\"crash\"}",
+    )
+
+  // After reconnection, server should still be registered
+  manager.list_servers(mgr) |> should.equal(["reconnect-test"])
+
+  // Second call: reconnected server responds normally
+  manager.execute_tool(
+    mgr,
+    "reconnect-test/echo",
+    "{\"message\":\"recovered\"}",
+  )
+  |> should.be_ok
+
+  manager.stop(mgr)
+}
+
+pub fn no_retry_evicts_on_crash_test() {
+  let assert Ok(mgr) = manager.start()
+
+  let config =
+    manager.ServerConfig(
+      name: "crashy",
+      command: "python3",
+      args: ["test/mock_mcp_server_crash.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_servers(mgr) |> should.equal(["crashy"])
+
+  let _ = manager.execute_tool(mgr, "crashy/echo", "{\"message\":\"hi\"}")
+
+  manager.list_servers(mgr) |> should.equal([])
+  manager.stop(mgr)
+}
+
+// ============================================================================
+// Regression Tests
 // ============================================================================
 
 pub fn large_response_does_not_truncate_test() {
@@ -329,24 +535,15 @@ pub fn large_response_does_not_truncate_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
 
-  let result =
+  let assert Ok(response) =
     manager.execute_tool(mgr, "large-server/big_data", "{}")
-  case result {
-    Ok(response) ->
-      // The big_data tool returns 8192 'A' characters — verify none were lost
-      response
-      |> string.contains("AAAAAAAA")
-      |> should.equal(True)
-    Error(e) -> {
-      let _ = e
-      should.fail()
-    }
-  }
 
+  response |> string.contains("AAAAAAAA") |> should.equal(True)
   manager.stop(mgr)
 }
 
@@ -359,35 +556,23 @@ pub fn special_chars_in_result_are_preserved_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
 
-  let result =
+  let assert Ok(response) =
     manager.execute_tool(
       mgr,
       "chars-server/special_chars",
       "{\"input\":\"hello\"}",
     )
-  case result {
-    Ok(response) ->
-      // Response contains backslash — if json_escape was broken this would
-      // produce invalid JSON and parse_jsonrpc_result would return Error
-      response
-      |> string.contains("hello")
-      |> should.equal(True)
-    Error(e) -> {
-      let _ = e
-      should.fail()
-    }
-  }
 
+  response |> string.contains("hello") |> should.equal(True)
   manager.stop(mgr)
 }
 
 pub fn incompatible_protocol_version_rejected_test() {
-  // A mock server that responds with an old/unknown protocol version
-  // should cause register() to return Error, not silently succeed
   let assert Ok(mgr) = manager.start()
 
   let config =
@@ -396,16 +581,11 @@ pub fn incompatible_protocol_version_rejected_test() {
       command: "python3",
       args: ["test/mock_mcp_server_old_version.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
-  // This should fail because the server announces an unsupported version
-  let result = manager.register(mgr, config)
-  result |> should.be_error
-
-  // Manager should still be alive and empty after the rejected registration
-  manager.list_servers(mgr)
-  |> should.equal([])
-
+  manager.register(mgr, config) |> should.be_error
+  manager.list_servers(mgr) |> should.equal([])
   manager.stop(mgr)
 }
 
@@ -418,18 +598,17 @@ pub fn tool_names_are_qualified_per_server_test() {
       command: "python3",
       args: ["test/mock_mcp_server.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
 
   let tools = manager.list_tools(mgr)
 
-  // Every tool name must be prefixed with the server name
   tools
   |> list.all(fn(t) { string.starts_with(t.spec.name, "my-server/") })
   |> should.equal(True)
 
-  // The original_name must NOT contain the server prefix
   tools
   |> list.all(fn(t) { !string.contains(t.original_name, "/") })
   |> should.equal(True)
@@ -438,32 +617,24 @@ pub fn tool_names_are_qualified_per_server_test() {
 }
 
 pub fn dead_server_is_evicted_after_crash_test() {
-  // A mock server that exits immediately after the handshake
   let assert Ok(mgr) = manager.start()
 
   let config =
     manager.ServerConfig(
-      name: "crashy",
+      name: "crashy2",
       command: "python3",
       args: ["test/mock_mcp_server_crash.py"],
       env: [],
+      retry: manager.NoRetry,
     )
 
   let assert Ok(Nil) = manager.register(mgr, config)
+  manager.list_servers(mgr) |> should.equal(["crashy2"])
 
-  // Server is listed as registered right after handshake
-  manager.list_servers(mgr)
-  |> should.equal(["crashy"])
+  let _ = manager.execute_tool(mgr, "crashy2/echo", "{\"message\":\"hi\"}")
 
-  // The crash server exits after registration; the next tool call should
-  // detect the dead port and evict the server from state
-  let _ = manager.execute_tool(mgr, "crashy/echo", "{\"message\":\"hi\"}")
+  manager.list_servers(mgr) |> should.equal([])
 
-  // After the failed call, the manager should have removed the dead server
-  manager.list_servers(mgr)
-  |> should.equal([])
-
-  // Manager itself must still be responsive
   let assert Ok(mgr2) = manager.start()
   manager.list_servers(mgr2) |> should.equal([])
   manager.stop(mgr2)

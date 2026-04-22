@@ -1,7 +1,7 @@
-# gleam_mcp
+# mcp_client
 
-[![Package Version](https://img.shields.io/hexpm/v/gleam_mcp)](https://hex.pm/packages/gleam_mcp)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/gleam_mcp/)
+[![Package Version](https://img.shields.io/hexpm/v/mcp_client)](https://hex.pm/packages/mcp_client)
+[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://hexdocs.pm/mcp_client/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Target](https://img.shields.io/badge/target-erlang-red)](https://gleam.run)
 
@@ -11,11 +11,11 @@
 
 ## What is MCP?
 
-The [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) is an open standard, introduced by Anthropic in late 2024, that defines how AI applications connect to external tools and data sources. It establishes a client–server architecture: a *host* (e.g. an LLM application) runs one or more *clients*, each connected to an *MCP server* that exposes capabilities (tools, resources, prompts) over a well-defined JSON-RPC 2.0 interface. Servers can be local processes launched over STDIO, or remote services reachable over HTTP/SSE. `gleam_mcp` implements the STDIO transport, which covers the vast majority of real-world MCP servers available today.
+The [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) is an open standard introduced by Anthropic in late 2024 that defines how AI applications connect to external tools and data sources. A *host* (e.g. an LLM application) runs one or more *clients*, each connected to an *MCP server* that exposes capabilities — tools, resources, and prompts — over a JSON-RPC 2.0 interface. Servers can be local processes launched over STDIO, or remote services reachable over HTTP/SSE. `mcp_client` implements the STDIO transport, which covers the vast majority of real-world MCP servers available today.
 
 ---
 
-## Why gleam_mcp?
+## Why mcp_client?
 
 Before this package, there was **no MCP client library in the Gleam or BEAM ecosystem**. Developers who wanted to integrate MCP servers into a Gleam application had three unsatisfying choices:
 
@@ -23,49 +23,7 @@ Before this package, there was **no MCP client library in the Gleam or BEAM ecos
 2. Shell out to a Node.js or Python MCP SDK wrapper — adds runtime overhead and a process-management burden.
 3. Skip MCP entirely and implement proprietary tool APIs — loses the growing ecosystem of ready-made MCP servers (GitHub, filesystem, search, databases, …).
 
-`gleam_mcp` fills this gap with a pure-Gleam/BEAM solution: lightweight, OTP-supervised actors, no Node.js runtime required, and a three-layer architecture that keeps each concern cleanly separated.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│  Application code                                               │
-│                                                                 │
-│    import gleam_mcp                                             │
-│    gleam_mcp.new() / .register() / .call() / .stop()           │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  thin wrappers
-┌──────────────────────────▼──────────────────────────────────────┐
-│  Facade  —  gleam_mcp.gleam                                     │
-│                                                                 │
-│  Exports:  Client  ServerConfig  Tool  ToolSpec                 │
-│  Wraps:    manager.start / register / unregister                │
-│            manager.list_servers / list_tools / execute_tool     │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  OTP actor (gen_server semantics)
-┌──────────────────────────▼──────────────────────────────────────┐
-│  Manager  —  gleam_mcp/manager.gleam                            │
-│                                                                 │
-│  • Maintains Dict(name, ServerConnection)                       │
-│  • Maintains Dict(qualified_name, Tool)                         │
-│  • MCP initialize handshake + protocol version validation       │
-│  • tools/list discovery on registration                         │
-│  • tools/call routing + request-id sequencing                   │
-│  • Dead-server eviction on port crash                           │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │  one StdioTransport actor per server
-┌──────────────────────────▼──────────────────────────────────────┐
-│  Transport  —  gleam_mcp/transport.gleam                        │
-│                                                                 │
-│  • Erlang port (spawn_executable + {line, 1 MB} + exit_status)  │
-│  • send_and_receive / send_only (fire-and-forget notifications) │
-│  • Controlled by gleam_mcp_ffi.erl (Erlang FFI)                │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-Each layer has a single responsibility. The transport knows nothing about MCP semantics — it only moves bytes. The manager speaks MCP but knows nothing about how the application uses the tools. The facade hides internal types and presents a stable public API.
+`mcp_client` fills this gap with a pure-Gleam/BEAM solution: lightweight OTP-supervised actors, no Node.js runtime required, and a three-layer architecture that keeps each concern cleanly separated.
 
 ---
 
@@ -75,50 +33,38 @@ Add the dependency to `gleam.toml`:
 
 ```toml
 [dependencies]
-gleam_mcp = ">= 0.1.0 and < 2.0.0"
+mcp_client = ">= 0.1.0 and < 2.0.0"
 ```
 
 Then:
 
 ```gleam
-import gleam_mcp
+import mcp_client
+import gleam/dict
 import gleam/io
-import gleam/list
 
 pub fn main() {
-  // 1. Create a client
-  let assert Ok(client) = gleam_mcp.new()
+  let assert Ok(client) = mcp_client.new()
 
-  // 2. Register one or more MCP servers
-  let assert Ok(Nil) = gleam_mcp.register(client, gleam_mcp.ServerConfig(
+  let assert Ok(Nil) = mcp_client.register(client, mcp_client.ServerConfig(
     name: "filesystem",
     command: "npx",
     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
     env: [],
+    retry: mcp_client.retry(max_attempts: 3, base_delay_ms: 500),
   ))
 
-  let assert Ok(Nil) = gleam_mcp.register(client, gleam_mcp.ServerConfig(
-    name: "github",
-    command: "npx",
-    args: ["-y", "@modelcontextprotocol/server-github"],
-    env: [#("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_...")],
-  ))
-
-  // 3. Discover available tools (qualified as "server_name/tool_name")
-  let tools = gleam_mcp.tools(client)
-  let names = list.map(tools, fn(t) { t.spec.name })
-  io.println("Available tools: " <> string.join(names, ", "))
-
-  // 4. Call a tool
-  let assert Ok(result) = gleam_mcp.call(
-    client,
-    "filesystem/list_directory",
-    "{\"path\":\"/tmp\"}",
+  // Call a tool
+  let assert Ok(result) = mcp_client.call(
+    client, "filesystem/list_directory", "{\"path\":\"/tmp\"}",
   )
   io.println(result)
 
-  // 5. Clean up
-  gleam_mcp.stop(client)
+  // Read a resource
+  let assert Ok(content) = mcp_client.read(client, "filesystem", "file:///tmp/hello.txt")
+  io.println(content)
+
+  mcp_client.stop(client)
 }
 ```
 
@@ -130,71 +76,132 @@ pub fn main() {
 
 | Type | Description |
 |------|-------------|
-| `Client` | Opaque handle to a running MCP client (alias for `McpManager` actor subject) |
-| `ServerConfig` | Configuration for one MCP server (`name`, `command`, `args`, `env`) |
-| `ToolSpec` | Tool name + description (`name: String`, `description: String`) |
-| `Tool` | Discovered tool: `spec: ToolSpec`, `server_name: String`, `original_name: String` |
+| `Client` | Opaque handle to a running MCP client |
+| `ServerConfig` | Server config: `name`, `command`, `args`, `env`, `retry` |
+| `RetryPolicy` | `NoRetry` or `Retry(max_attempts, base_delay_ms)` |
+| `ToolSpec` | Tool name + description |
+| `Tool` | Discovered tool: `spec`, `server_name`, `original_name` |
+| `Resource` | Discovered resource: `uri`, `name`, `description`, `server_name` |
+| `PromptArg` | Prompt argument definition: `name`, `description`, `required` |
+| `Prompt` | Discovered prompt template: `name`, `description`, `server_name`, `arguments` |
 
 ### Functions
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `new` | `() -> Result(Client, actor.StartError)` | Start a new MCP client |
-| `register` | `(Client, ServerConfig) -> Result(Nil, String)` | Connect to a server, handshake, discover tools |
-| `unregister` | `(Client, String) -> Result(Nil, String)` | Disconnect from a server and remove its tools |
-| `servers` | `(Client) -> List(String)` | Names of all registered servers (sorted) |
-| `tools` | `(Client) -> List(Tool)` | All discovered tools across all servers |
-| `call` | `(Client, String, String) -> Result(String, String)` | Execute a tool by qualified name with JSON args |
+| `new` | `() -> Result(Client, _)` | Start a new MCP client |
 | `stop` | `(Client) -> Nil` | Shutdown client and all server processes |
+| `register` | `(Client, ServerConfig) -> Result(Nil, String)` | Connect to a server; discovers tools, resources, and prompts |
+| `unregister` | `(Client, String) -> Result(Nil, String)` | Disconnect from a server; removes all its capabilities |
+| `servers` | `(Client) -> List(String)` | Names of all registered servers |
+| `tools` | `(Client) -> List(Tool)` | All discovered tools across all servers |
+| `call` | `(Client, String, String) -> Result(String, String)` | Execute a tool by qualified name (`"server/tool"`) with JSON args |
+| `resources` | `(Client) -> List(Resource)` | All discovered resources across all servers |
+| `read` | `(Client, String, String) -> Result(String, String)` | Read a resource by server name + URI |
+| `prompts` | `(Client) -> List(Prompt)` | All discovered prompt templates across all servers |
+| `prompt` | `(Client, String, String, Dict(String,String)) -> Result(String, String)` | Render a prompt by server name + prompt name + args |
+| `no_retry` | `RetryPolicy` | Constant — evict server on crash, no reconnection |
+| `retry` | `(Int, Int) -> RetryPolicy` | Retry with exponential backoff: `retry(max_attempts, base_delay_ms)` |
 
-**Tool name convention:** after `register/2`, every tool name is qualified as `"server_name/tool_name"`. This avoids collisions when multiple servers expose tools with the same bare name (e.g. both a filesystem and a GitHub server might offer a `"list"` tool). The `original_name` field on `Tool` holds the bare name as declared by the server.
+### Return values
 
-### Lower-level modules
+All three call functions (`call`, `read`, `prompt`) return `Result(String, String)` where the `Ok` value is the raw JSON string of the `result` field from the JSON-RPC 2.0 response. Callers parse it however they need; `gleam_json` is the natural choice.
 
-The `gleam_mcp/transport` and `gleam_mcp/manager` modules are also public if you need direct access to the transport or manager actors — for example, to build a custom routing layer.
+### Tool name convention
+
+After `register`, every tool name is qualified as `"server_name/tool_name"`. This prevents collisions when multiple servers expose tools with the same bare name. The `original_name` field on `Tool` holds the bare name as declared by the server.
+
+---
+
+## Retry and reconnection
+
+When an MCP server crashes, the default behaviour (`NoRetry`) is to evict it from state — subsequent calls to its tools return `Error`. With a `Retry` policy, the manager automatically tries to reconnect with exponential backoff before evicting:
+
+```gleam
+// Retry up to 3 times: sleeps 500ms, 1000ms, 2000ms between attempts
+retry: mcp_client.retry(max_attempts: 3, base_delay_ms: 500)
+
+// No reconnection — evict immediately on crash
+retry: mcp_client.no_retry
+```
+
+The specific call that triggered the crash still returns `Error` (the response was lost). Subsequent calls on the same server succeed once reconnection completes. If all attempts fail, the server is evicted and the manager remains operational for other servers.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Application code                                               │
+│    mcp_client.new() / register() / call() / read() / prompt()   │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  thin wrappers
+┌──────────────────────────▼──────────────────────────────────────┐
+│  Facade  —  mcp_client.gleam                                     │
+│  Exports: Client  ServerConfig  RetryPolicy                     │
+│           Tool  Resource  Prompt  PromptArg                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  OTP actor (gen_server semantics)
+┌──────────────────────────▼──────────────────────────────────────┐
+│  Manager  —  mcp_client/manager.gleam                            │
+│  • Dict(name, ServerConnection) + Dict(qualified, Tool)         │
+│  • List(Resource) + List(Prompt) per registered server          │
+│  • MCP initialize handshake + protocol version validation       │
+│  • tools/list · resources/list · prompts/list on registration   │
+│  • tools/call · resources/read · prompts/get routing            │
+│  • Crash detection → eviction or exponential-backoff reconnect  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │  one StdioTransport actor per server
+┌──────────────────────────▼──────────────────────────────────────┐
+│  Transport  —  mcp_client/transport.gleam                        │
+│  • Erlang port (spawn_executable + {line, 1 MB} + exit_status)  │
+│  • send_and_receive / send_only                                 │
+│  • Backed by mcp_client_ffi.erl                                  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+Each layer has a single responsibility. The transport knows nothing about MCP semantics — it only moves bytes. The manager speaks MCP but knows nothing about how the application uses the results. The facade hides internal types and presents a stable public API.
 
 ---
 
 ## Protocol compliance
 
-`gleam_mcp` implements the **MCP 2024-11-05** specification.
+`mcp_client` implements the **MCP 2024-11-05** specification.
 
 | Feature | Status |
 |---------|--------|
 | Transport | STDIO (newline-delimited JSON-RPC 2.0) |
-| `initialize` request | Implemented — sends `protocolVersion`, `capabilities`, `clientInfo` |
-| Protocol version validation | Strict — rejects servers that advertise unsupported versions |
-| `notifications/initialized` | Sent after successful initialize |
-| `tools/list` | Implemented — called automatically on registration |
-| `tools/call` | Implemented — routes by qualified name, increments request-id |
-| `resources/*` | Not implemented (planned) |
-| `prompts/*` | Not implemented (planned) |
-| HTTP/SSE transport | Not implemented (planned) |
+| `initialize` / `notifications/initialized` | ✅ |
+| Protocol version validation | ✅ Strict — rejects unsupported versions |
+| `tools/list` + `tools/call` | ✅ |
+| `resources/list` + `resources/read` | ✅ |
+| `prompts/list` + `prompts/get` | ✅ |
+| Auto-reconnection with exponential backoff | ✅ |
+| HTTP/SSE transport (MCP 2025-03-26) | Not implemented — planned for v0.3.0 |
 | Server-sent notifications | Not implemented |
-
-The client sends `clientInfo: {name: "gleam_mcp", version: "0.1.0"}` during the initialize handshake.
 
 ---
 
 ## Design decisions
 
-### 1. Qualified tool names (`server_name/tool_name`)
-Multiple MCP servers frequently expose tools with identical bare names (`read_file`, `search`, `list`). Qualifying every name with the server prefix at discovery time — rather than at call time — means the caller never has to think about which server a tool came from. The `original_name` field is preserved so the manager can use it when sending `tools/call` to the correct server.
+### Qualified tool names (`server_name/tool_name`)
+Multiple MCP servers frequently expose tools with identical bare names (`read_file`, `search`, `list`). Qualifying every name with the server prefix at discovery time means the caller never has to think about which server a tool came from. `original_name` is preserved so the manager can use it in `tools/call`.
 
-### 2. Isolated stderr
-Erlang ports opened with `spawn_executable` only capture stdout. MCP servers commonly write log messages and debug output to stderr. By not capturing stderr, those messages go directly to the OS process's stderr without polluting the JSON-RPC response stream. This was the cause of intermittent parse failures in early prototypes when servers emitted startup logs.
+### Isolated stderr
+Erlang ports opened with `spawn_executable` only capture stdout. MCP servers commonly write logs to stderr. By not capturing stderr, those messages reach the OS without polluting the JSON-RPC response stream — the root cause of intermittent parse failures in early prototypes.
 
-### 3. 1 MB line buffer (`{line, 1048576}`)
-The MCP protocol sends each JSON-RPC message as a single newline-terminated line. Real-world tool responses (especially from filesystem and search servers) can exceed tens of kilobytes. Erlang's default `{line, N}` buffer of 1024 bytes would silently truncate these responses, producing parse errors. A 1 MB buffer safely handles all observed payloads; the `big_data` integration test verifies 8 KB responses are not truncated.
+### 1 MB line buffer (`{line, 1048576}`)
+The MCP protocol sends each JSON-RPC message as a single newline-terminated line. Real-world tool responses (filesystem listings, search results) can exceed tens of kilobytes. Erlang's default `{line, 1024}` would silently truncate them. The `big_data` integration test verifies 8 KB responses are not truncated.
 
-### 4. Dead-server eviction on port crash
-If an MCP server process dies unexpectedly, the next `tools/call` returns an error containing "exited" or "Port not open". The manager detects this, removes the server and all its tools from state, and continues running. The client remains fully functional for other registered servers. This is tested with `mock_mcp_server_crash.py`, which exits immediately after the `tools/list` handshake.
+### Dead-server eviction / reconnection
+If a server process dies, the next call returns an error containing "exited" or equivalent. With `NoRetry` the server is evicted immediately; with `Retry` the manager sleeps and re-runs the full connection sequence (initialize → tools/list → resources/list → prompts/list). Reconnection is synchronous inside the manager actor, so the client is briefly paused during backoff. The specific call that triggered the crash still returns `Error`; subsequent calls succeed on the restored connection.
 
-### 5. Protocol version validation
-The `initialize` response must contain `protocolVersion: "2024-11-05"`. Any other value causes `register/2` to return `Error(...)` and the transport is stopped. This prevents silently operating against incompatible servers that might behave differently. New versions can be supported by updating `supported_protocol_versions/0` in `manager.gleam`.
+### `attempt_connection` as the single connection entry point
+Both initial registration and reconnection go through `attempt_connection/1`, which starts the transport, runs the initialize handshake, and discovers all three capability types. This guarantees consistent state after reconnection — tools, resources, and prompts are always re-fetched together.
 
-### 6. Three-layer separation
-Transport, manager, and facade are separate modules with clear contracts. This makes it possible to swap the transport (e.g. add HTTP/SSE) without touching the manager, and to change the public API without touching protocol logic. It also simplifies testing: transport tests use raw JSON-RPC strings; manager tests use the full MCP handshake; facade tests verify delegation only.
+### Three-layer separation
+Transport, manager, and facade are separate modules with clear contracts. Adding HTTP/SSE transport in v0.3.0 will not require touching manager or facade code. Transport tests use raw JSON-RPC strings; manager tests run the full MCP handshake; facade tests verify delegation only.
 
 ---
 
@@ -209,13 +216,11 @@ The following production MCP servers have been used with this client:
 | Shell Server (fastmcp) | `mcp-server-shell` via `fastmcp` | Custom tool execution via shell commands |
 | Brave Search MCP | `@modelcontextprotocol/server-brave-search` | `brave_web_search` with API key via env |
 
-All servers were registered, tools discovered, and tools invoked successfully with `gleam_mcp 0.1.0`.
-
 ---
 
 ## Extraction origin
 
-`gleam_mcp` was extracted from [Supernova](https://github.com/manelsen/supernova), a Gleam-based AI assistant runtime. The MCP client layer was originally written as `supernova/adapters/mcp/stdio`, `supernova/adapters/mcp_manager`, and `supernova_mcp_ffi.erl`. It was promoted to a standalone package to make it reusable by any Gleam project that needs MCP connectivity.
+`mcp_client` was extracted from [Supernova](https://github.com/manelsen/supernova), a Gleam-based AI assistant runtime. The MCP client layer was originally written as `supernova/adapters/mcp/stdio`, `supernova/adapters/mcp_manager`, and `supernova_mcp_ffi.erl`. It was promoted to a standalone package to make it reusable by any Gleam project that needs MCP connectivity.
 
 ---
 

@@ -2,13 +2,10 @@
 """Mock MCP server for testing JSON-RPC 2.0 over STDIO.
 
 Responds to:
-- initialize: returns protocol version and capabilities
-- tools/list: returns a list of mock tools
-- tools/call: executes a mock tool and returns result
-- notifications/initialized: acknowledges (no response)
-
-Usage:
-    echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{...}}' | python3 mock_mcp_server.py
+- initialize, notifications/initialized
+- tools/list, tools/call (echo, add, big_data, special_chars)
+- resources/list, resources/read
+- prompts/list, prompts/get
 """
 
 import json
@@ -16,7 +13,6 @@ import sys
 
 
 def handle_request(request):
-    """Handle a JSON-RPC 2.0 request and return response."""
     method = request.get("method", "")
     req_id = request.get("id")
     params = request.get("params", {})
@@ -27,16 +23,12 @@ def handle_request(request):
             "id": req_id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {
-                    "name": "mock-mcp-server",
-                    "version": "1.0.0",
-                },
+                "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
+                "serverInfo": {"name": "mock-mcp-server", "version": "1.0.0"},
             },
         }
 
     elif method == "notifications/initialized":
-        # No response for notifications
         return None
 
     elif method == "tools/list":
@@ -50,12 +42,7 @@ def handle_request(request):
                         "description": "Echo back the input message",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "message": {
-                                    "type": "string",
-                                    "description": "Message to echo",
-                                }
-                            },
+                            "properties": {"message": {"type": "string"}},
                             "required": ["message"],
                         },
                     },
@@ -65,8 +52,8 @@ def handle_request(request):
                         "inputSchema": {
                             "type": "object",
                             "properties": {
-                                "a": {"type": "number", "description": "First number"},
-                                "b": {"type": "number", "description": "Second number"},
+                                "a": {"type": "number"},
+                                "b": {"type": "number"},
                             },
                             "required": ["a", "b"],
                         },
@@ -81,9 +68,7 @@ def handle_request(request):
                         "description": "Returns text with JSON special characters",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "input": {"type": "string", "description": "Input text"}
-                            },
+                            "properties": {"input": {"type": "string"}},
                             "required": ["input"],
                         },
                     },
@@ -102,42 +87,117 @@ def handle_request(request):
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": message}]},
             }
-
         elif tool_name == "add":
-            a = arguments.get("a", 0)
-            b = arguments.get("b", 0)
-            result = a + b
+            result = arguments.get("a", 0) + arguments.get("b", 0)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": str(result)}]},
             }
-
         elif tool_name == "big_data":
-            # 8 KB of text — well above the old 1024-byte line buffer
             text = "A" * 8192
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": text}]},
             }
-
         elif tool_name == "special_chars":
             inp = arguments.get("input", "")
-            # Echo back inside a string that itself contains JSON special chars
             text = f'Result: "{inp}" with backslash \\ and newline embedded'
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "result": {"content": [{"type": "text", "text": text}]},
             }
-
         else:
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Tool not found: {tool_name}"},
             }
+
+    elif method == "resources/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "resources": [
+                    {
+                        "uri": "file:///hello.txt",
+                        "name": "hello.txt",
+                        "description": "A greeting file",
+                        "mimeType": "text/plain",
+                    },
+                    {
+                        "uri": "file:///world.txt",
+                        "name": "world.txt",
+                        "description": "A world file",
+                        "mimeType": "text/plain",
+                    },
+                ]
+            },
+        }
+
+    elif method == "resources/read":
+        uri = params.get("uri", "")
+        contents = {
+            "file:///hello.txt": "Hello, world!",
+            "file:///world.txt": "The world is round.",
+        }
+        if uri in contents:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "contents": [{"uri": uri, "mimeType": "text/plain", "text": contents[uri]}]
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Resource not found: {uri}"},
+        }
+
+    elif method == "prompts/list":
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "prompts": [
+                    {
+                        "name": "greet",
+                        "description": "Generate a greeting",
+                        "arguments": [
+                            {"name": "name", "description": "Name to greet", "required": True}
+                        ],
+                    }
+                ]
+            },
+        }
+
+    elif method == "prompts/get":
+        prompt_name = params.get("name", "")
+        arguments = params.get("arguments", {})
+        if prompt_name == "greet":
+            name = arguments.get("name", "World")
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "description": "Greeting prompt",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": {"type": "text", "text": f"Please greet {name} warmly."},
+                        }
+                    ],
+                },
+            }
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Prompt not found: {prompt_name}"},
+        }
 
     else:
         return {
@@ -148,12 +208,10 @@ def handle_request(request):
 
 
 def main():
-    """Read JSON-RPC requests from stdin and write responses to stdout."""
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
-
         try:
             request = json.loads(line)
             response = handle_request(request)
@@ -161,20 +219,10 @@ def main():
                 sys.stdout.write(json.dumps(response) + "\n")
                 sys.stdout.flush()
         except json.JSONDecodeError:
-            error_response = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32700, "message": "Parse error"},
-            }
-            sys.stdout.write(json.dumps(error_response) + "\n")
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}}) + "\n")
             sys.stdout.flush()
         except Exception as e:
-            error_response = {
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32603, "message": str(e)},
-            }
-            sys.stdout.write(json.dumps(error_response) + "\n")
+            sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}) + "\n")
             sys.stdout.flush()
 
 

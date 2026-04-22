@@ -4,7 +4,7 @@
 
 import gleam/string
 import gleeunit/should
-import gleam_mcp/transport
+import mcp_client/transport
 
 // ============================================================================
 // Basic Transport Tests

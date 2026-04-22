@@ -2,8 +2,8 @@
 %%
 %% Opens OS processes via Erlang ports and communicates via
 %% newline-delimited JSON-RPC 2.0 over STDIO.
--module(gleam_mcp_ffi).
--export([open_port/3, send_and_receive/3, send_data/2, close_port/1, dynamic_to_json/1]).
+-module(mcp_client_ffi).
+-export([open_port/3, send_and_receive/3, send_data/2, close_port/1, dynamic_to_json/1, delete_file_if_exists/1]).
 
 %% Open an OS process and return {ok, Port} or {error, Reason}.
 %% Uses Erlang port with {line, 1048576} for line-buffered STDIO communication (1 MB buffer).
@@ -113,6 +113,11 @@ collect_rest(Port, Acc, TimeoutMs) ->
   after TimeoutMs ->
     {error, <<"timeout">>}
   end.
+
+%% Delete a file if it exists; always returns nil.
+delete_file_if_exists(Path) ->
+  catch file:delete(binary_to_list(Path)),
+  nil.
 
 %% Convert a dynamic (arbitrary Erlang term) to JSON string.
 dynamic_to_json(Term) ->
