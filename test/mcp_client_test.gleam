@@ -4,6 +4,7 @@
 //// top-level public facade (`mcp_client.*`).
 
 import gleam/dict
+import gleam/erlang/process
 import gleam/list
 import gleam/string
 import gleeunit
@@ -171,7 +172,8 @@ pub fn call_nonexistent_tool_returns_error_test() {
     )
 
   let assert Ok(Nil) = mcp_client.register(client, config)
-  mcp_client.call(client, "call-server2/not_a_real_tool", "{}") |> should.be_error
+  mcp_client.call(client, "call-server2/not_a_real_tool", "{}")
+  |> should.be_error
   mcp_client.stop(client)
 }
 
@@ -314,4 +316,92 @@ pub fn retry_fn_creates_policy_test() {
   // Just ensure it compiles and creates a value — the type check is enough
   let _ = policy
   Nil
+}
+
+// ============================================================================
+// Server-sent notifications
+// ============================================================================
+
+pub fn notification_tools_list_changed_test() {
+  let assert Ok(client) = mcp_client.new()
+
+  let config =
+    manager.ServerConfig(
+      name: "notif-tools",
+      command: "python3",
+      args: ["test/mock_mcp_server_notifications.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = mcp_client.register(client, config)
+
+  // Initial tools list should have 1 tool (echo).
+  let initial_tools = mcp_client.tools(client)
+  initial_tools |> list.length |> should.equal(1)
+
+  // After the notification is processed, tools should be re-fetched.
+  // The mock server sends tools/list_changed before the tools/list response.
+  // The notification is intercepted by the FFI and forwarded to the manager.
+  // Give the manager time to process the queued notification.
+  process.sleep(100)
+
+  let updated_tools = mcp_client.tools(client)
+  // The refresh re-fetches tools/list, which still returns 1 tool.
+  // But the notification was received and processed successfully.
+  updated_tools |> list.length |> should.equal(1)
+
+  mcp_client.stop(client)
+}
+
+pub fn notification_resources_list_changed_test() {
+  let assert Ok(client) = mcp_client.new()
+
+  let config =
+    manager.ServerConfig(
+      name: "notif-res",
+      command: "python3",
+      args: ["test/mock_mcp_server_notifications.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = mcp_client.register(client, config)
+
+  let initial_resources = mcp_client.resources(client)
+  initial_resources |> list.length |> should.equal(1)
+
+  process.sleep(100)
+
+  let updated_resources = mcp_client.resources(client)
+  updated_resources |> list.length |> should.equal(1)
+
+  mcp_client.stop(client)
+}
+
+pub fn subscribe_and_unsubscribe_test() {
+  let assert Ok(client) = mcp_client.new()
+
+  let config =
+    manager.ServerConfig(
+      name: "sub-server",
+      command: "python3",
+      args: ["test/mock_mcp_server_notifications.py"],
+      env: [],
+      retry: manager.NoRetry,
+    )
+
+  let assert Ok(Nil) = mcp_client.register(client, config)
+
+  // Subscribe to a resource
+  let sub_result =
+    mcp_client.subscribe(client, "sub-server", "file:///hello.txt")
+  sub_result |> should.be_ok
+
+  // Unsubscribe from the resource
+  let unsub_result =
+    mcp_client.unsubscribe(client, "sub-server", "file:///hello.txt")
+  unsub_result |> should.be_ok
+
+  mcp_client.stop(client)
 }

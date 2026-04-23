@@ -1,9 +1,9 @@
-%% gleam_mcp_ffi — Erlang FFI for MCP STDIO transport.
+%% mcp_client_ffi — Erlang FFI for MCP STDIO transport.
 %%
 %% Opens OS processes via Erlang ports and communicates via
 %% newline-delimited JSON-RPC 2.0 over STDIO.
 -module(mcp_client_ffi).
--export([open_port/3, send_and_receive/3, send_data/2, close_port/1, dynamic_to_json/1, delete_file_if_exists/1]).
+-export([open_port/3, send_and_receive/3, send_data/2, close_port/1, dynamic_to_json/1, delete_file_if_exists/1, drain_notifications/1]).
 
 %% Open an OS process and return {ok, Port} or {error, Reason}.
 %% Uses Erlang port with {line, 1048576} for line-buffered STDIO communication (1 MB buffer).
@@ -50,16 +50,16 @@ resolve_command(CommandStr) ->
       end
   end.
 
-%% Send data to port and wait for a complete line response.
-%% Returns {ok, Line} | {error, Reason}.
-%% NOTE: This must be called from the process that opened the port,
-%% or the port's controlling process must be changed first.
+%% Send data to port and wait for a JSON-RPC response.
+%% Intercepts server-sent notifications (lines without "id") during the wait,
+%% collecting them and returning alongside the response.
+%% Returns {ok, {ResponseLine, Notifications}} | {error, Reason},
+%% where Notifications is a list of notification binary strings.
 send_and_receive(Port, Data, TimeoutMs) ->
   try
-    %% Ensure this process is the port's controlling process
     erlang:port_connect(Port, self()),
     Port ! {self(), {command, <<Data/binary, "\n">>}},
-    wait_for_line(Port, TimeoutMs)
+    wait_for_line(Port, TimeoutMs, os:timestamp())
   catch
     _:Reason ->
       {error, list_to_binary(io_lib:format("Send/receive failed: ~p", [Reason]))}
@@ -87,31 +87,104 @@ close_port(Port) ->
   end,
   nil.
 
-%% Internal: wait for a complete line from the port.
-wait_for_line(Port, TimeoutMs) ->
+%% Drain any buffered notification messages from the port.
+%% Uses zero timeout — only picks up what's already in the mailbox.
+%% Returns a list of notification binary strings.
+drain_notifications(Port) ->
+  drain_notifications(Port, []).
+
+drain_notifications(Port, Acc) ->
   receive
     {Port, {data, {eol, Line}}} ->
-      {ok, Line};
+      case is_notification(Line) of
+        true ->
+          drain_notifications(Port, [Line | Acc]);
+        false ->
+          %% Not a notification — put it back in the mailbox and stop draining.
+          %% Erlang doesn't have "unreceive", so we re-send to self.
+          self() ! {Port, {data, {eol, Line}}},
+          lists:reverse(Acc)
+      end;
     {Port, {data, {noeol, Partial}}} ->
-      %% Incomplete line, wait for the rest
-      collect_rest(Port, Partial, TimeoutMs);
-    {Port, {exit_status, Status}} ->
-      {error, list_to_binary(io_lib:format("Process exited with status ~p", [Status]))}
-  after TimeoutMs ->
-    {error, <<"timeout">>}
+      %% Incomplete line — re-queue and stop. Can't meaningfully handle
+      %% partial lines during drain.
+      self() ! {Port, {data, {noeol, Partial}}},
+      lists:reverse(Acc)
+  after 0 ->
+    lists:reverse(Acc)
+  end.
+
+%% Internal: wait for a complete JSON-RPC response line from the port.
+%% Notifications (lines without "id") are collected and skipped.
+%% Returns {ok, {ResponseLine, Notifications}} | {error, Reason}.
+wait_for_line(Port, TimeoutMs, StartTime) ->
+  Elapsed = timer:now_diff(os:timestamp(), StartTime) div 1000,
+  Remaining = TimeoutMs - Elapsed,
+  case Remaining =< 0 of
+    true ->
+      {error, <<"timeout">>};
+    false ->
+      receive
+        {Port, {data, {eol, Line}}} ->
+          case is_notification(Line) of
+            true ->
+              %% Notification — collect it and keep waiting for the response.
+              case wait_for_line(Port, TimeoutMs, StartTime) of
+                {ok, {Resp, Notes}} ->
+                  {ok, {Resp, [Line | Notes]}};
+                Error ->
+                  Error
+              end;
+            false ->
+              {ok, {Line, []}}
+          end;
+        {Port, {data, {noeol, Partial}}} ->
+          collect_rest(Port, Partial, TimeoutMs, StartTime, []);
+        {Port, {exit_status, Status}} ->
+          {error, list_to_binary(io_lib:format("Process exited with status ~p", [Status]))}
+      after Remaining ->
+        {error, <<"timeout">>}
+      end
   end.
 
 %% Internal: collect remaining data until we get eol or timeout.
-collect_rest(Port, Acc, TimeoutMs) ->
-  receive
-    {Port, {data, {eol, Rest}}} ->
-      {ok, <<Acc/binary, Rest/binary>>};
-    {Port, {data, {noeol, Partial}}} ->
-      collect_rest(Port, <<Acc/binary, Partial/binary>>, TimeoutMs);
-    {Port, {exit_status, Status}} ->
-      {error, list_to_binary(io_lib:format("Process exited with status ~p", [Status]))}
-  after TimeoutMs ->
-    {error, <<"timeout">>}
+%% Notifications intercepted during multi-line assembly are collected.
+collect_rest(Port, Acc, TimeoutMs, StartTime, Notes) ->
+  Elapsed = timer:now_diff(os:timestamp(), StartTime) div 1000,
+  Remaining = TimeoutMs - Elapsed,
+  case Remaining =< 0 of
+    true ->
+      {error, <<"timeout">>};
+    false ->
+      receive
+        {Port, {data, {eol, Rest}}} ->
+          FullLine = <<Acc/binary, Rest/binary>>,
+          case is_notification(FullLine) of
+            true ->
+              %% Notification collected during multi-line read — keep waiting.
+              wait_for_line(Port, TimeoutMs, StartTime);
+            false ->
+              case Notes of
+                [] -> {ok, {FullLine, []}};
+                _ -> {ok, {FullLine, lists:reverse(Notes)}}
+              end
+          end;
+        {Port, {data, {noeol, Partial}}} ->
+          collect_rest(Port, <<Acc/binary, Partial/binary>>, TimeoutMs, StartTime, Notes);
+        {Port, {exit_status, Status}} ->
+          {error, list_to_binary(io_lib:format("Process exited with status ~p", [Status]))}
+      after Remaining ->
+        {error, <<"timeout">>}
+      end
+  end.
+
+%% Check if a JSON-RPC message is a notification (no "id" field).
+%% Uses a simple binary search for the "id" key rather than full JSON parsing.
+%% A JSON-RPC response always has "id". A notification never does.
+is_notification(Line) ->
+  case binary:match(Line, <<"\"id\"">>) of
+    nomatch -> true;
+    _ -> false
   end.
 
 %% Delete a file if it exists; always returns nil.
@@ -119,58 +192,12 @@ delete_file_if_exists(Path) ->
   catch file:delete(binary_to_list(Path)),
   nil.
 
-%% Convert a dynamic (arbitrary Erlang term) to JSON string.
+%% Convert an Erlang term (from gleam/dynamic) to a JSON binary string.
+%% Uses the OTP 27 json module — the same encoder that gleam_json v3 uses.
 dynamic_to_json(Term) ->
   try
-    JsonStr = format_as_json(Term),
-    {ok, list_to_binary(JsonStr)}
+    {ok, iolist_to_binary(json:encode(Term))}
   catch
     _:Reason ->
       {error, list_to_binary(io_lib:format("Failed to encode JSON: ~p", [Reason]))}
   end.
-
-%% Escape a string for safe JSON embedding.
-escape_json_string([]) -> [];
-escape_json_string([$" | Rest])  -> [$\\, $"  | escape_json_string(Rest)];
-escape_json_string([$\\ | Rest]) -> [$\\, $\\ | escape_json_string(Rest)];
-escape_json_string([$\n | Rest]) -> [$\\, $n  | escape_json_string(Rest)];
-escape_json_string([$\r | Rest]) -> [$\\, $r  | escape_json_string(Rest)];
-escape_json_string([$\t | Rest]) -> [$\\, $t  | escape_json_string(Rest)];
-escape_json_string([C | Rest])   -> [C        | escape_json_string(Rest)].
-
-%% Simple JSON formatter for common Erlang terms.
-format_as_json(Term) when is_binary(Term) ->
-  "\"" ++ escape_json_string(binary_to_list(Term)) ++ "\"";
-format_as_json(Term) when is_list(Term) ->
-  case io_lib:printable_list(Term) of
-    true ->
-      "\"" ++ escape_json_string(Term) ++ "\"";
-    false ->
-      %% It's a list/array
-      "[" ++ string:join([format_as_json(E) || E <- Term], ",") ++ "]"
-  end;
-format_as_json(Term) when is_map(Term) ->
-  Pairs = maps:to_list(Term),
-  FormattedPairs = [format_key_value(K, V) || {K, V} <- Pairs],
-  "{" ++ string:join(FormattedPairs, ",") ++ "}";
-format_as_json(Term) when is_integer(Term) ->
-  integer_to_list(Term);
-format_as_json(Term) when is_float(Term) ->
-  float_to_list(Term);
-format_as_json(true) ->
-  "true";
-format_as_json(false) ->
-  "false";
-format_as_json(nil) ->
-  "null";
-format_as_json(null) ->
-  "null";
-format_as_json(_) ->
-  "null".
-
-format_key_value(Key, Value) when is_binary(Key) ->
-  "\"" ++ binary_to_list(Key) ++ "\":" ++ format_as_json(Value);
-format_key_value(Key, Value) when is_atom(Key) ->
-  "\"" ++ atom_to_list(Key) ++ "\":" ++ format_as_json(Value);
-format_key_value(Key, Value) ->
-  "\"" ++ lists:flatten(io_lib:format("~p", [Key])) ++ "\":" ++ format_as_json(Value).

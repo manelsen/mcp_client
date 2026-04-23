@@ -1,6 +1,6 @@
-//// gleam_mcp — MCP (Model Context Protocol) client for Gleam.
+//// mcp_client — MCP (Model Context Protocol) client for Gleam.
 ////
-//// Public facade for the gleam_mcp package. Provides an ergonomic API for
+//// Public facade for the mcp_client package. Provides an ergonomic API for
 //// connecting to MCP servers, discovering tools/resources/prompts, and
 //// invoking them via JSON-RPC 2.0 over STDIO.
 ////
@@ -11,21 +11,21 @@
 //// import gleam/dict
 ////
 //// pub fn main() {
-////   let assert Ok(client) = gleam_mcp.new()
+////   let assert Ok(client) = mcp_client.new()
 ////
-////   let config = gleam_mcp.ServerConfig(
+////   let config = mcp_client.ServerConfig(
 ////     name: "filesystem",
 ////     command: "npx",
 ////     args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
 ////     env: [],
-////     retry: gleam_mcp.no_retry,
+////     retry: mcp_client.no_retry,
 ////   )
-////   let assert Ok(Nil) = gleam_mcp.register(client, config)
+////   let assert Ok(Nil) = mcp_client.register(client, config)
 ////
-////   let tools = gleam_mcp.tools(client)
-////   let assert Ok(result) = gleam_mcp.call(client, "filesystem/list_directory", "{\"path\":\"/tmp\"}")
+////   let tools = mcp_client.tools(client)
+////   let assert Ok(result) = mcp_client.call(client, "filesystem/list_directory", "{\"path\":\"/tmp\"}")
 ////
-////   gleam_mcp.stop(client)
+////   mcp_client.stop(client)
 //// }
 //// ```
 
@@ -83,7 +83,7 @@ pub const no_retry: RetryPolicy = manager.NoRetry
 /// ## Example
 ///
 /// ```gleam
-/// gleam_mcp.retry(max_attempts: 3, base_delay_ms: 500)
+/// mcp_client.retry(max_attempts: 3, base_delay_ms: 500)
 /// ```
 pub fn retry(max_attempts: Int, base_delay_ms: Int) -> RetryPolicy {
   manager.Retry(max_attempts: max_attempts, base_delay_ms: base_delay_ms)
@@ -98,7 +98,7 @@ pub fn retry(max_attempts: Int, base_delay_ms: Int) -> RetryPolicy {
 /// ## Example
 ///
 /// ```gleam
-/// let assert Ok(client) = gleam_mcp.new()
+/// let assert Ok(client) = mcp_client.new()
 /// ```
 pub fn new() -> Result(Client, actor.StartError) {
   manager.start()
@@ -112,14 +112,14 @@ pub fn new() -> Result(Client, actor.StartError) {
 /// ## Example
 ///
 /// ```gleam
-/// let config = gleam_mcp.ServerConfig(
+/// let config = mcp_client.ServerConfig(
 ///   name: "github",
 ///   command: "npx",
 ///   args: ["-y", "@modelcontextprotocol/server-github"],
 ///   env: [#("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_...")],
-///   retry: gleam_mcp.retry(3, 500),
+///   retry: mcp_client.retry(3, 500),
 /// )
-/// let assert Ok(Nil) = gleam_mcp.register(client, config)
+/// let assert Ok(Nil) = mcp_client.register(client, config)
 /// ```
 pub fn register(client: Client, config: ServerConfig) -> Result(Nil, String) {
   manager.register(client, config)
@@ -153,7 +153,7 @@ pub fn tools(client: Client) -> List(Tool) {
 /// ## Example
 ///
 /// ```gleam
-/// let assert Ok(result) = gleam_mcp.call(
+/// let assert Ok(result) = mcp_client.call(
 ///   client,
 ///   "filesystem/read_file",
 ///   "{\"path\":\"/etc/hostname\"}",
@@ -179,7 +179,7 @@ pub fn resources(client: Client) -> List(Resource) {
 /// ## Example
 ///
 /// ```gleam
-/// let assert Ok(result) = gleam_mcp.read(client, "filesystem", "file:///etc/hostname")
+/// let assert Ok(result) = mcp_client.read(client, "filesystem", "file:///etc/hostname")
 /// ```
 pub fn read(
   client: Client,
@@ -202,7 +202,7 @@ pub fn prompts(client: Client) -> List(Prompt) {
 /// ## Example
 ///
 /// ```gleam
-/// let assert Ok(result) = gleam_mcp.prompt(
+/// let assert Ok(result) = mcp_client.prompt(
 ///   client, "myserver", "summarize",
 ///   dict.from_list([#("text", "Hello world")]),
 /// )
@@ -219,4 +219,22 @@ pub fn prompt(
 /// Stop the client and all server connections.
 pub fn stop(client: Client) -> Nil {
   manager.stop(client)
+}
+
+/// Subscribe to updates for a specific resource URI on a server.
+pub fn subscribe(
+  client: Client,
+  server: String,
+  uri: String,
+) -> Result(Nil, String) {
+  manager.subscribe_resource(client, server, uri)
+}
+
+/// Unsubscribe from updates for a specific resource URI on a server.
+pub fn unsubscribe(
+  client: Client,
+  server: String,
+  uri: String,
+) -> Result(Nil, String) {
+  manager.unsubscribe_resource(client, server, uri)
 }

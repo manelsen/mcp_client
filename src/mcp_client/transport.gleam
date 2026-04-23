@@ -13,6 +13,7 @@
 //// ```
 
 import gleam/erlang/process.{type Subject}
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/string
@@ -33,13 +34,16 @@ fn do_send_and_receive(
   port: Dynamic,
   data: String,
   timeout_ms: Int,
-) -> Result(String, String)
+) -> Result(#(String, List(String)), String)
 
 @external(erlang, "mcp_client_ffi", "send_data")
 fn do_send_data(port: Dynamic, data: String) -> Result(Nil, String)
 
 @external(erlang, "mcp_client_ffi", "close_port")
 fn do_close_port(port: Dynamic) -> Nil
+
+@external(erlang, "mcp_client_ffi", "drain_notifications")
+fn do_drain_notifications(port: Dynamic) -> List(String)
 
 /// Opaque type for Erlang port references.
 pub type Dynamic
@@ -50,7 +54,9 @@ pub type Dynamic
 
 /// Messages for the STDIO transport actor.
 pub type StdioMessage {
-  /// Send a JSON-RPC message and wait for response
+  /// Send a JSON-RPC message and wait for response.
+  /// Any server-sent notifications intercepted during the wait are forwarded
+  /// to the notification handler after the response is delivered.
   SendReceive(
     reply_to: Subject(Result(String, String)),
     data: String,
@@ -58,6 +64,8 @@ pub type StdioMessage {
   )
   /// Send a JSON-RPC message without waiting (for notifications)
   SendOnly(reply_to: Subject(Result(Nil, String)), data: String)
+  /// Internal: a server-sent notification was received.
+  NotificationReceived(data: String)
   /// Stop the transport and kill the process
   Stop(reply_to: Subject(Nil))
 }
@@ -74,6 +82,7 @@ type StdioState {
     args: List(String),
     env: List(#(String, String)),
     connected: Bool,
+    notification_handler: Option(Subject(String)),
   )
 }
 
@@ -90,8 +99,30 @@ fn handle_message(
       case state.port {
         Some(port) -> {
           let result = do_send_and_receive(port, data, timeout_ms)
-          actor.send(reply_to, result)
-          actor.continue(state)
+          case result {
+            Ok(#(response, notifications)) -> {
+              // Forward intercepted notifications to the handler.
+              case state.notification_handler {
+                Some(handler) ->
+                  list.each(notifications, fn(n) { actor.send(handler, n) })
+                None -> Nil
+              }
+              // Drain any additional notifications buffered in the port mailbox.
+              case state.notification_handler {
+                Some(handler) -> {
+                  let drained = do_drain_notifications(port)
+                  list.each(drained, fn(n) { actor.send(handler, n) })
+                }
+                None -> Nil
+              }
+              actor.send(reply_to, Ok(response))
+              actor.continue(state)
+            }
+            Error(e) -> {
+              actor.send(reply_to, Error(e))
+              actor.continue(state)
+            }
+          }
         }
         None -> {
           actor.send(reply_to, Error("Port not open"))
@@ -112,6 +143,17 @@ fn handle_message(
           actor.continue(state)
         }
       }
+    }
+
+    // Server-sent notifications are forwarded to the manager via the
+    // notification_handler subject. This variant is only used if the
+    // notification arrives between requests and gets drained.
+    NotificationReceived(data) -> {
+      case state.notification_handler {
+        Some(handler) -> actor.send(handler, data)
+        None -> Nil
+      }
+      actor.continue(state)
     }
 
     Stop(reply_to) -> {
@@ -136,6 +178,27 @@ pub fn start(
   args: List(String),
   env: List(#(String, String)),
 ) -> Result(StdioTransport, String) {
+  do_start(command, args, env, None)
+}
+
+/// Start a STDIO transport with a notification handler.
+/// Server-sent notifications (e.g. `notifications/tools/list_changed`) are
+/// forwarded to the given subject as raw JSON strings.
+pub fn start_with_notifications(
+  command: String,
+  args: List(String),
+  env: List(#(String, String)),
+  notification_handler: Subject(String),
+) -> Result(StdioTransport, String) {
+  do_start(command, args, env, Some(notification_handler))
+}
+
+fn do_start(
+  command: String,
+  args: List(String),
+  env: List(#(String, String)),
+  notification_handler: Option(Subject(String)),
+) -> Result(StdioTransport, String) {
   case do_open_port(command, args, env) {
     Ok(port) -> {
       let initial_state =
@@ -145,6 +208,7 @@ pub fn start(
           args: args,
           env: env,
           connected: True,
+          notification_handler: notification_handler,
         )
 
       case

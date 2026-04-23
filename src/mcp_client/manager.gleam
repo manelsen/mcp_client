@@ -111,12 +111,17 @@ type ServerConnection {
     transport: StdioTransport,
     initialized: Bool,
     request_id: Int,
+    manager: McpManager,
   )
 }
 
 /// Messages for the manager actor.
 pub type ManagerMessage {
-  RegisterServer(reply_to: Subject(Result(Nil, String)), config: ServerConfig)
+  RegisterServer(
+    reply_to: Subject(Result(Nil, String)),
+    config: ServerConfig,
+    manager: McpManager,
+  )
   UnregisterServer(reply_to: Subject(Result(Nil, String)), name: String)
   ListServers(reply_to: Subject(List(String)))
   GetServerConfig(reply_to: Subject(Result(ServerConfig, String)), name: String)
@@ -139,6 +144,18 @@ pub type ManagerMessage {
     name: String,
     args: Dict(String, String),
   )
+  SubscribeResource(
+    reply_to: Subject(Result(Nil, String)),
+    server_name: String,
+    uri: String,
+  )
+  UnsubscribeResource(
+    reply_to: Subject(Result(Nil, String)),
+    server_name: String,
+    uri: String,
+  )
+  /// Internal: a server-sent notification was received from a transport.
+  ServerNotification(server_name: String, raw_json: String)
   Stop(reply_to: Subject(Nil))
 }
 
@@ -341,9 +358,7 @@ fn parse_resources_response(
   }
 }
 
-fn resources_list_decoder(
-  server_name: String,
-) -> decode.Decoder(List(Resource)) {
+fn resources_list_decoder(server_name: String) -> decode.Decoder(List(Resource)) {
   use resources <- decode.field(
     "resources",
     decode.list(resource_decoder(server_name)),
@@ -355,9 +370,12 @@ fn resource_decoder(server_name: String) -> decode.Decoder(Resource) {
   use uri <- decode.field("uri", decode.string)
   use name <- decode.optional_field("name", uri, decode.string)
   use description <- decode.optional_field("description", "", decode.string)
-  decode.success(
-    Resource(uri: uri, name: name, description: description, server_name: server_name),
-  )
+  decode.success(Resource(
+    uri: uri,
+    name: name,
+    description: description,
+    server_name: server_name,
+  ))
 }
 
 fn send_resources_read(
@@ -419,7 +437,11 @@ fn prompt_arg_decoder() -> decode.Decoder(PromptArg) {
   use name <- decode.field("name", decode.string)
   use description <- decode.optional_field("description", "", decode.string)
   use required <- decode.optional_field("required", False, decode.bool)
-  decode.success(PromptArg(name: name, description: description, required: required))
+  decode.success(PromptArg(
+    name: name,
+    description: description,
+    required: required,
+  ))
 }
 
 fn prompt_decoder(server_name: String) -> decode.Decoder(Prompt) {
@@ -430,14 +452,12 @@ fn prompt_decoder(server_name: String) -> decode.Decoder(Prompt) {
     [],
     decode.list(prompt_arg_decoder()),
   )
-  decode.success(
-    Prompt(
-      name: name,
-      description: description,
-      server_name: server_name,
-      arguments: arguments,
-    ),
-  )
+  decode.success(Prompt(
+    name: name,
+    description: description,
+    server_name: server_name,
+    arguments: arguments,
+  ))
 }
 
 fn send_prompts_get(
@@ -471,13 +491,26 @@ fn send_prompts_get(
 // Connection lifecycle
 // ============================================================================
 
-/// Start a transport, run the MCP initialize handshake, and discover all
-/// tools, resources, and prompts. Returns the live transport plus discovered
-/// items. On failure, the transport is stopped before returning Error.
+/// Start a transport with notification forwarding, run the MCP initialize
+/// handshake, and discover all tools, resources, and prompts.
+/// Returns the live transport, forwarder, and discovered items.
+/// On failure, the transport is stopped before returning Error.
 fn attempt_connection(
   config: ServerConfig,
-) -> Result(#(StdioTransport, List(Tool), List(Resource), List(Prompt)), String) {
-  case transport.start(config.command, config.args, config.env) {
+  manager_subject: McpManager,
+) -> Result(
+  #(StdioTransport, Subject(String), List(Tool), List(Resource), List(Prompt)),
+  String,
+) {
+  let forwarder = start_notification_forwarder(manager_subject, config.name)
+  case
+    transport.start_with_notifications(
+      config.command,
+      config.args,
+      config.env,
+      forwarder,
+    )
+  {
     Ok(t) ->
       case send_initialize(t, 1) {
         Ok(_) -> {
@@ -490,7 +523,7 @@ fn attempt_connection(
           let prompts =
             send_prompts_list(t, 4, config.name)
             |> result.unwrap([])
-          Ok(#(t, tools, resources, prompts))
+          Ok(#(t, forwarder, tools, resources, prompts))
         }
         Error(e) -> {
           transport.stop(t)
@@ -498,6 +531,42 @@ fn attempt_connection(
         }
       }
     Error(e) -> Error(e)
+  }
+}
+
+// ============================================================================
+// Notification forwarding
+// ============================================================================
+
+/// Spawn a minimal actor that receives raw JSON notification strings and
+/// forwards them as ServerNotification messages to the manager.
+fn start_notification_forwarder(
+  manager: McpManager,
+  server_name: String,
+) -> Subject(String) {
+  let assert Ok(forwarder) =
+    actor.new(Nil)
+    |> actor.on_message(fn(_state, json: String) {
+      actor.send(manager, ServerNotification(server_name, json))
+      actor.continue(Nil)
+    })
+    |> actor.start
+  forwarder.data
+}
+
+// ============================================================================
+// Notification method parsing
+// ============================================================================
+
+fn notification_method_decoder() -> decode.Decoder(String) {
+  use method <- decode.field("method", decode.string)
+  decode.success(method)
+}
+
+fn parse_notification_method(raw: String) -> Result(String, String) {
+  case json.parse(raw, notification_method_decoder()) {
+    Ok(method) -> Ok(method)
+    Error(_) -> Error("Failed to parse notification method")
   }
 }
 
@@ -576,7 +645,7 @@ fn try_reconnect(state: ManagerState, server_name: String) -> ManagerState {
   case dict.get(state.servers, server_name) {
     Error(_) -> state
     Ok(connection) ->
-      do_reconnect(state, server_name, connection.config, 0)
+      do_reconnect(state, server_name, connection.config, connection.manager, 0)
   }
 }
 
@@ -591,6 +660,7 @@ fn do_reconnect(
   state: ManagerState,
   server_name: String,
   config: ServerConfig,
+  manager: McpManager,
   attempt: Int,
 ) -> ManagerState {
   case config.retry {
@@ -601,14 +671,15 @@ fn do_reconnect(
         False -> {
           let delay = int.min(base_delay_ms * int_pow(2, attempt), 30_000)
           process.sleep(delay)
-          case attempt_connection(config) {
-            Ok(#(t, tools, resources, prompts)) -> {
+          case attempt_connection(config, manager) {
+            Ok(#(t, _forwarder, tools, resources, prompts)) -> {
               let new_conn =
                 ServerConnection(
                   config: config,
                   transport: t,
                   initialized: True,
                   request_id: 5,
+                  manager: manager,
                 )
               let clean = evict_dead_server(state, server_name)
               let new_servers =
@@ -627,10 +698,148 @@ fn do_reconnect(
               )
             }
             Error(_) ->
-              do_reconnect(state, server_name, config, attempt + 1)
+              do_reconnect(state, server_name, config, manager, attempt + 1)
           }
         }
       }
+  }
+}
+
+// ============================================================================
+// Server notification handling
+// ============================================================================
+
+/// Handle a server-sent notification by dispatching to the appropriate refresh.
+fn handle_server_notification(
+  state: ManagerState,
+  server_name: String,
+  method: String,
+) -> ManagerState {
+  case method {
+    "notifications/tools/list_changed" -> refresh_tools(state, server_name)
+    "notifications/resources/list_changed" ->
+      refresh_resources(state, server_name)
+    "notifications/prompts/list_changed" -> refresh_prompts(state, server_name)
+    _ -> state
+  }
+}
+
+/// Re-fetch tools/list for a server and update state.
+fn refresh_tools(state: ManagerState, server_name: String) -> ManagerState {
+  case dict.get(state.servers, server_name) {
+    Ok(connection) -> {
+      let id = connection.request_id
+      let new_tools = case
+        send_tools_list(connection.transport, id, server_name)
+      {
+        Ok(tools) -> {
+          // Remove old tools from this server, insert new ones.
+          let filtered =
+            dict.filter(state.tools, fn(_k, t) { t.server_name != server_name })
+          list.fold(tools, filtered, fn(acc, tool) {
+            dict.insert(acc, tool.spec.name, tool)
+          })
+        }
+        Error(_) -> state.tools
+      }
+      let updated = ServerConnection(..connection, request_id: id + 1)
+      ManagerState(
+        ..state,
+        servers: dict.insert(state.servers, server_name, updated),
+        tools: new_tools,
+      )
+    }
+    Error(_) -> state
+  }
+}
+
+/// Re-fetch resources/list for a server and update state.
+fn refresh_resources(state: ManagerState, server_name: String) -> ManagerState {
+  case dict.get(state.servers, server_name) {
+    Ok(connection) -> {
+      let id = connection.request_id
+      let new_resources = case
+        send_resources_list(connection.transport, id, server_name)
+      {
+        Ok(resources) -> {
+          let filtered =
+            list.filter(state.resources, fn(r) { r.server_name != server_name })
+          list.append(filtered, resources)
+        }
+        Error(_) -> state.resources
+      }
+      let updated = ServerConnection(..connection, request_id: id + 1)
+      ManagerState(
+        ..state,
+        servers: dict.insert(state.servers, server_name, updated),
+        resources: new_resources,
+      )
+    }
+    Error(_) -> state
+  }
+}
+
+/// Re-fetch prompts/list for a server and update state.
+fn refresh_prompts(state: ManagerState, server_name: String) -> ManagerState {
+  case dict.get(state.servers, server_name) {
+    Ok(connection) -> {
+      let id = connection.request_id
+      let new_prompts = case
+        send_prompts_list(connection.transport, id, server_name)
+      {
+        Ok(prompts) -> {
+          let filtered =
+            list.filter(state.prompts, fn(p) { p.server_name != server_name })
+          list.append(filtered, prompts)
+        }
+        Error(_) -> state.prompts
+      }
+      let updated = ServerConnection(..connection, request_id: id + 1)
+      ManagerState(
+        ..state,
+        servers: dict.insert(state.servers, server_name, updated),
+        prompts: new_prompts,
+      )
+    }
+    Error(_) -> state
+  }
+}
+
+// ============================================================================
+// MCP Protocol: Resource subscriptions
+// ============================================================================
+
+fn send_resources_subscribe(
+  t: StdioTransport,
+  id: Int,
+  uri: String,
+) -> Result(Nil, String) {
+  let params = json.object([#("uri", json.string(uri))])
+  let request = jsonrpc_request(id, "resources/subscribe", params)
+  case transport.send_and_receive(t, request, 10_000) {
+    Ok(response) ->
+      case parse_jsonrpc_result(response) {
+        Ok(_) -> Ok(Nil)
+        Error(e) -> Error("resources/subscribe failed: " <> e)
+      }
+    Error(e) -> Error("resources/subscribe timeout/error: " <> e)
+  }
+}
+
+fn send_resources_unsubscribe(
+  t: StdioTransport,
+  id: Int,
+  uri: String,
+) -> Result(Nil, String) {
+  let params = json.object([#("uri", json.string(uri))])
+  let request = jsonrpc_request(id, "resources/unsubscribe", params)
+  case transport.send_and_receive(t, request, 10_000) {
+    Ok(response) ->
+      case parse_jsonrpc_result(response) {
+        Ok(_) -> Ok(Nil)
+        Error(e) -> Error("resources/unsubscribe failed: " <> e)
+      }
+    Error(e) -> Error("resources/unsubscribe timeout/error: " <> e)
   }
 }
 
@@ -643,7 +852,7 @@ fn handle_message(
   message: ManagerMessage,
 ) -> actor.Next(ManagerState, ManagerMessage) {
   case message {
-    RegisterServer(reply_to, config) ->
+    RegisterServer(reply_to, config, manager) ->
       case dict.get(state.servers, config.name) {
         Ok(_) -> {
           actor.send(
@@ -653,14 +862,15 @@ fn handle_message(
           actor.continue(state)
         }
         Error(_) ->
-          case attempt_connection(config) {
-            Ok(#(t, tools, resources, prompts)) -> {
+          case attempt_connection(config, manager) {
+            Ok(#(t, _forwarder, tools, resources, prompts)) -> {
               let connection =
                 ServerConnection(
                   config: config,
                   transport: t,
                   initialized: True,
                   request_id: 5,
+                  manager: manager,
                 )
               let new_servers =
                 dict.insert(state.servers, config.name, connection)
@@ -671,21 +881,17 @@ fn handle_message(
               let new_resources = list.append(state.resources, resources)
               let new_prompts = list.append(state.prompts, prompts)
               actor.send(reply_to, Ok(Nil))
-              actor.continue(
-                ManagerState(
-                  servers: new_servers,
-                  tools: new_tools,
-                  resources: new_resources,
-                  prompts: new_prompts,
-                ),
-              )
+              actor.continue(ManagerState(
+                servers: new_servers,
+                tools: new_tools,
+                resources: new_resources,
+                prompts: new_prompts,
+              ))
             }
             Error(e) -> {
               actor.send(
                 reply_to,
-                Error(
-                  "Failed to initialize " <> config.name <> ": " <> e,
-                ),
+                Error("Failed to initialize " <> config.name <> ": " <> e),
               )
               actor.continue(state)
             }
@@ -698,22 +904,18 @@ fn handle_message(
           transport.stop(connection.transport)
           let new_servers = dict.delete(state.servers, name)
           let new_tools =
-            dict.filter(state.tools, fn(_key, tool) {
-              tool.server_name != name
-            })
+            dict.filter(state.tools, fn(_key, tool) { tool.server_name != name })
           let new_resources =
             list.filter(state.resources, fn(r) { r.server_name != name })
           let new_prompts =
             list.filter(state.prompts, fn(p) { p.server_name != name })
           actor.send(reply_to, Ok(Nil))
-          actor.continue(
-            ManagerState(
-              servers: new_servers,
-              tools: new_tools,
-              resources: new_resources,
-              prompts: new_prompts,
-            ),
-          )
+          actor.continue(ManagerState(
+            servers: new_servers,
+            tools: new_tools,
+            resources: new_resources,
+            prompts: new_prompts,
+          ))
         }
         Error(_) -> {
           actor.send(reply_to, Error("Server not found: " <> name))
@@ -765,11 +967,7 @@ fn handle_message(
                   let updated =
                     ServerConnection(..connection, request_id: id + 1)
                   let new_servers =
-                    dict.insert(
-                      state.servers,
-                      mcp_tool.server_name,
-                      updated,
-                    )
+                    dict.insert(state.servers, mcp_tool.server_name, updated)
                   actor.send(reply_to, result)
                   actor.continue(ManagerState(..state, servers: new_servers))
                 }
@@ -809,10 +1007,8 @@ fn handle_message(
           let result = send_resources_read(connection.transport, id, uri)
           case result {
             Ok(_) -> {
-              let updated =
-                ServerConnection(..connection, request_id: id + 1)
-              let new_servers =
-                dict.insert(state.servers, server_name, updated)
+              let updated = ServerConnection(..connection, request_id: id + 1)
+              let new_servers = dict.insert(state.servers, server_name, updated)
               actor.send(reply_to, result)
               actor.continue(ManagerState(..state, servers: new_servers))
             }
@@ -844,10 +1040,8 @@ fn handle_message(
           let result = send_prompts_get(connection.transport, id, name, args)
           case result {
             Ok(_) -> {
-              let updated =
-                ServerConnection(..connection, request_id: id + 1)
-              let new_servers =
-                dict.insert(state.servers, server_name, updated)
+              let updated = ServerConnection(..connection, request_id: id + 1)
+              let new_servers = dict.insert(state.servers, server_name, updated)
               actor.send(reply_to, result)
               actor.continue(ManagerState(..state, servers: new_servers))
             }
@@ -867,6 +1061,46 @@ fn handle_message(
         }
       }
 
+    ServerNotification(server_name, raw_json) -> {
+      let new_state = case parse_notification_method(raw_json) {
+        Ok(method) -> handle_server_notification(state, server_name, method)
+        Error(_) -> state
+      }
+      actor.continue(new_state)
+    }
+
+    SubscribeResource(reply_to, server_name, uri) ->
+      case dict.get(state.servers, server_name) {
+        Ok(connection) -> {
+          let id = connection.request_id
+          let result = send_resources_subscribe(connection.transport, id, uri)
+          let updated = ServerConnection(..connection, request_id: id + 1)
+          let new_servers = dict.insert(state.servers, server_name, updated)
+          actor.send(reply_to, result)
+          actor.continue(ManagerState(..state, servers: new_servers))
+        }
+        Error(_) -> {
+          actor.send(reply_to, Error("Server not found: " <> server_name))
+          actor.continue(state)
+        }
+      }
+
+    UnsubscribeResource(reply_to, server_name, uri) ->
+      case dict.get(state.servers, server_name) {
+        Ok(connection) -> {
+          let id = connection.request_id
+          let result = send_resources_unsubscribe(connection.transport, id, uri)
+          let updated = ServerConnection(..connection, request_id: id + 1)
+          let new_servers = dict.insert(state.servers, server_name, updated)
+          actor.send(reply_to, result)
+          actor.continue(ManagerState(..state, servers: new_servers))
+        }
+        Error(_) -> {
+          actor.send(reply_to, Error("Server not found: " <> server_name))
+          actor.continue(state)
+        }
+      }
+
     Stop(reply_to) -> {
       dict.each(state.servers, fn(_key, connection) {
         transport.stop(connection.transport)
@@ -876,7 +1110,6 @@ fn handle_message(
     }
   }
 }
-
 
 // ============================================================================
 // Public API
@@ -907,7 +1140,11 @@ pub fn register(
   manager: McpManager,
   config: ServerConfig,
 ) -> Result(Nil, String) {
-  actor.call(manager, waiting: 30_000, sending: RegisterServer(_, config))
+  actor.call(manager, waiting: 30_000, sending: RegisterServer(
+    _,
+    config,
+    manager,
+  ))
 }
 
 /// Unregister an MCP server and stop its process.
@@ -939,11 +1176,7 @@ pub fn execute_tool(
   tool_name: String,
   args: String,
 ) -> Result(String, String) {
-  actor.call(
-    manager,
-    waiting: 30_000,
-    sending: ExecuteTool(_, tool_name, args),
-  )
+  actor.call(manager, waiting: 30_000, sending: ExecuteTool(_, tool_name, args))
 }
 
 /// List all resources discovered across all servers.
@@ -957,11 +1190,11 @@ pub fn read_resource(
   server_name: String,
   uri: String,
 ) -> Result(String, String) {
-  actor.call(
-    manager,
-    waiting: 30_000,
-    sending: ReadResource(_, server_name, uri),
-  )
+  actor.call(manager, waiting: 30_000, sending: ReadResource(
+    _,
+    server_name,
+    uri,
+  ))
 }
 
 /// List all prompts discovered across all servers.
@@ -976,14 +1209,43 @@ pub fn get_prompt(
   name: String,
   args: Dict(String, String),
 ) -> Result(String, String) {
-  actor.call(
-    manager,
-    waiting: 30_000,
-    sending: GetPrompt(_, server_name, name, args),
-  )
+  actor.call(manager, waiting: 30_000, sending: GetPrompt(
+    _,
+    server_name,
+    name,
+    args,
+  ))
 }
 
 /// Stop the manager and all server connections.
 pub fn stop(manager: McpManager) -> Nil {
   actor.call(manager, waiting: 10_000, sending: Stop)
+}
+
+/// Subscribe to updates for a specific resource URI on a server.
+/// Sends a `resources/subscribe` JSON-RPC request.
+pub fn subscribe_resource(
+  manager: McpManager,
+  server_name: String,
+  uri: String,
+) -> Result(Nil, String) {
+  actor.call(manager, waiting: 10_000, sending: SubscribeResource(
+    _,
+    server_name,
+    uri,
+  ))
+}
+
+/// Unsubscribe from updates for a specific resource URI on a server.
+/// Sends a `resources/unsubscribe` JSON-RPC request.
+pub fn unsubscribe_resource(
+  manager: McpManager,
+  server_name: String,
+  uri: String,
+) -> Result(Nil, String) {
+  actor.call(manager, waiting: 10_000, sending: UnsubscribeResource(
+    _,
+    server_name,
+    uri,
+  ))
 }
